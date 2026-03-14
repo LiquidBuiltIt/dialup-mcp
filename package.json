@@ -1,0 +1,45 @@
+{
+  "name": "dialup-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MCP-based inter-agent communication tool for Claude Code",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "dialup": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/mcp/index.js",
+    "daemon": "node dist/daemon/index.js",
+    "dialup": "node dist/cli/index.js",
+    "lint": "tsc --noEmit",
+    "test": "node --test dist/**/*.test.js"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "agent",
+    "inter-agent",
+    "communication"
+  ],
+  "author": "liquidbuiltit",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^25.3.5",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.1.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "uuid": "^13.0.0",
+    "zod": "^4.3.6"
+  }
+}

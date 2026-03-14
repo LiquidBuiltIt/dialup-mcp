@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "dialup-mcp": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/Users/jahcrispy646/Projects/Typescript/dialup-mcp/dist/mcp/index.js"
+      ],
+      "env": {}
+    }
+  }
+}
