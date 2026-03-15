@@ -1,6 +1,6 @@
 {
   "name": "dialup-mcp",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "MCP-based inter-agent communication tool for Claude Code",
   "main": "dist/index.js",
@@ -20,7 +20,8 @@
     "daemon": "node dist/daemon/index.js",
     "dialup": "node dist/cli/index.js",
     "lint": "tsc --noEmit",
-    "test": "node --test dist/**/*.test.js"
+    "test": "node --test dist/**/*.test.js",
+    "version.bump": "npx tsx scripts/version.bump.ts"
   },
   "keywords": [
     "mcp",

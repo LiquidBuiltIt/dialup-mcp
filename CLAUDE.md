@@ -54,6 +54,19 @@ npm run lint         # lint with eslint
 npm test             # run tests
 ```
 
+## Version Bumping
+
+Use the version bump script for all releases. A message is **mandatory**.
+
+```bash
+npm run version.bump patch "fix heartbeat race condition"
+npm run version.bump minor "add execute mode"
+npm run version.bump major "v1 stable release"
+npm run version.bump rollback   # undo last bump if not pushed
+```
+
+The script bumps `package.json`, commits as `v{version} — {message}`, and tags. Review the commit then push manually: `git push && git push --tags`.
+
 ## Conventions
 
 - TypeScript, strict mode
