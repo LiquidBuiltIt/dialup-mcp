@@ -29,6 +29,8 @@ Claude Session B → MCP Server B ──┘         │
 
 ## Setup
 
+### Interactive (humans)
+
 ```bash
 npx dialup-mcp -- setup
 ```
@@ -40,7 +42,47 @@ The setup wizard:
 4. Asks whether to enable execute mode and which tools to whitelist
 5. Writes `.dialup.config.json` to each project and registers them centrally
 
-Then add the MCP server to Claude Code:
+### Programmatic (agents / CI)
+
+```bash
+npx dialup-mcp -- register \
+  --project /path/to/project \
+  --agent my-api \
+  --description "REST API handling auth and billing" \
+  --executeMode false
+```
+
+With execute mode enabled:
+
+```bash
+npx dialup-mcp -- register \
+  --project . \
+  --agent my-api \
+  --description "REST API" \
+  --executeMode Write,Edit \
+  --systemPrompt "Focus on the API layer"
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--project` | Yes | Path to the project directory |
+| `--agent` | Yes | Agent name (unique identifier) |
+| `--description` | Yes | What this agent/project does |
+| `--executeMode` | Yes | `false` or comma-separated tools: `Bash,Write,Edit,NotebookEdit` |
+| `--systemPrompt` | No | Custom system prompt for this agent |
+
+### Daemon Management
+
+```bash
+npx dialup-mcp -- service start     # start the daemon
+npx dialup-mcp -- service stop      # stop the daemon
+npx dialup-mcp -- service restart   # restart (picks up config changes)
+npx dialup-mcp -- service status    # check if daemon is running
+```
+
+### MCP Server Registration
+
+Add the MCP server to Claude Code:
 
 ```bash
 claude mcp add dialup -- npx dialup-mcp

@@ -5,13 +5,40 @@ import { discoverProjects, getDefaultSearchRoots } from './discovery.js';
 import { runWizard } from './wizard.js';
 import { writeConfigs } from './config-writer.js';
 import { registerMcpServer } from './register.js';
+import { handleService } from './service.js';
+import { handleRegister } from './register.cmd.js';
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  const command = args[0];
 
-  if (!args.includes('setup')) {
-    console.log('Usage: dialup setup');
-    console.log('       npx dialup-mcp -- setup');
+  if (command === 'service') {
+    const action = args[1];
+    if (!action) {
+      console.error('Usage: dialup service <start|stop|restart|status>');
+      process.exit(1);
+    }
+    await handleService(action);
+    return;
+  }
+
+  if (command === 'register') {
+    await handleRegister(args.slice(1));
+    return;
+  }
+
+  if (command !== 'setup') {
+    console.log('Usage:');
+    console.log('  dialup setup                                            # interactive setup wizard');
+    console.log('  dialup register --project <path> --agent <name> ...     # programmatic registration');
+    console.log('  dialup service <start|stop|restart|status>              # manage daemon');
+    console.log('');
+    console.log('Register flags:');
+    console.log('  --project <path>         Project directory (required)');
+    console.log('  --agent <name>           Agent name (required)');
+    console.log('  --description <desc>     Agent description (required)');
+    console.log('  --executeMode <mode>     "false" or comma-separated tools: Bash,Write,Edit,NotebookEdit (required)');
+    console.log('  --systemPrompt <prompt>  Custom system prompt (optional)');
     process.exit(0);
   }
 
