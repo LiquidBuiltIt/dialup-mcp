@@ -15,13 +15,13 @@ describe('DialupConfigSchema', () => {
     assert.equal(result.systemPrompt, undefined);
   });
 
-  it('parses config with executeMode tool whitelist', () => {
+  it('parses config with executeMode: true', () => {
     const result = DialupConfigSchema.parse({
       agent: 'my-agent',
       description: 'A test agent',
-      executeMode: ['Bash', 'Write', 'Edit'],
+      executeMode: true,
     });
-    assert.deepEqual(result.executeMode, ['Bash', 'Write', 'Edit']);
+    assert.equal(result.executeMode, true);
   });
 
   it('parses config with all fields', () => {
@@ -29,10 +29,10 @@ describe('DialupConfigSchema', () => {
       agent: 'my-agent',
       description: 'A test agent',
       systemPrompt: 'You are helpful',
-      executeMode: ['NotebookEdit'],
+      executeMode: true,
     });
     assert.equal(result.systemPrompt, 'You are helpful');
-    assert.deepEqual(result.executeMode, ['NotebookEdit']);
+    assert.equal(result.executeMode, true);
   });
 
   it('rejects missing agent', () => {
@@ -72,42 +72,55 @@ describe('DialupConfigSchema', () => {
     });
   });
 
-  it('rejects invalid tool names in executeMode', () => {
+  it('rejects non-boolean executeMode values', () => {
     assert.throws(() => {
       DialupConfigSchema.parse({
         agent: 'my-agent',
         description: 'A test agent',
-        executeMode: ['Read'],
+        executeMode: 'yes',
       });
     });
   });
 
-  it('rejects non-executive tools in executeMode', () => {
+  it('rejects array executeMode (no longer supported)', () => {
     assert.throws(() => {
       DialupConfigSchema.parse({
         agent: 'my-agent',
         description: 'A test agent',
-        executeMode: ['Glob'],
+        executeMode: ['Write', 'Edit'],
       });
     });
   });
 
-  it('rejects random strings in executeMode', () => {
-    assert.throws(() => {
-      DialupConfigSchema.parse({
-        agent: 'my-agent',
-        description: 'A test agent',
-        executeMode: ['FakeToolThatDoesNotExist'],
-      });
-    });
-  });
-
-  it('accepts empty executeMode array', () => {
+  it('defaults model to haiku when not specified', () => {
     const result = DialupConfigSchema.parse({
       agent: 'my-agent',
       description: 'A test agent',
-      executeMode: [],
+      executeMode: false,
     });
-    assert.deepEqual(result.executeMode, []);
+    assert.equal(result.model, 'haiku');
+  });
+
+  it('accepts valid model values', () => {
+    for (const model of ['default', 'haiku', 'sonnet', 'opus']) {
+      const result = DialupConfigSchema.parse({
+        agent: 'my-agent',
+        description: 'A test agent',
+        executeMode: false,
+        model,
+      });
+      assert.equal(result.model, model);
+    }
+  });
+
+  it('rejects invalid model values', () => {
+    assert.throws(() => {
+      DialupConfigSchema.parse({
+        agent: 'my-agent',
+        description: 'A test agent',
+        executeMode: false,
+        model: 'gpt-4',
+      });
+    });
   });
 });

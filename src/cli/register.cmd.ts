@@ -1,17 +1,19 @@
 import { writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { CONFIG_FILENAME } from '../shared/constants.js';
-import { EXECUTE_TOOLS } from '../shared/types.js';
+import { AGENT_MODELS } from '../shared/types.js';
 import { parseDialupConfig } from '../shared/config.js';
 import { registerAgent } from '../shared/registry.js';
-import type { ExecuteTool } from '../shared/types.js';
+import { notifyDaemon } from '../shared/notify.js';
+import type { AgentModel } from '../shared/types.js';
 
 interface RegisterArgs {
   project: string;
   agent: string;
   description: string;
-  executeMode: false | ExecuteTool[];
+  executeMode: boolean;
   systemPrompt?: string;
+  model: AgentModel;
 }
 
 function parseArgs(args: string[]): RegisterArgs {
@@ -45,20 +47,24 @@ function parseArgs(args: string[]): RegisterArgs {
     process.exit(1);
   }
 
-  // Parse executeMode: "false" → false, "Write,Edit" → ['Write', 'Edit']
-  let executeMode: false | ExecuteTool[];
+  // Parse executeMode: "false" → false, "true" → true
+  let executeMode: boolean;
   if (flags.executeMode === 'false') {
     executeMode = false;
+  } else if (flags.executeMode === 'true') {
+    executeMode = true;
   } else {
-    const tools = flags.executeMode.split(',').map((t) => t.trim()).filter(Boolean);
-    for (const tool of tools) {
-      if (!EXECUTE_TOOLS.includes(tool as ExecuteTool)) {
-        console.error(`Invalid tool in --executeMode: "${tool}"`);
-        console.error(`Valid tools: ${EXECUTE_TOOLS.join(', ')}`);
-        process.exit(1);
-      }
-    }
-    executeMode = tools as ExecuteTool[];
+    console.error(`Invalid --executeMode: "${flags.executeMode}". Must be "true" or "false".`);
+    printUsage();
+    process.exit(1);
+  }
+
+  // Parse model: default to 'default' if not provided
+  const model = (flags.model || 'haiku') as AgentModel;
+  if (!AGENT_MODELS.includes(model)) {
+    console.error(`Invalid --model: "${flags.model}"`);
+    console.error(`Valid models: ${AGENT_MODELS.join(', ')}`);
+    process.exit(1);
   }
 
   return {
@@ -67,25 +73,28 @@ function parseArgs(args: string[]): RegisterArgs {
     description: flags.description,
     executeMode,
     systemPrompt: flags.systemPrompt || undefined,
+    model,
   };
 }
 
 function printUsage(): void {
-  console.error('\nUsage: dialup register --project <path> --agent <name> --description <desc> --executeMode <false|tools>');
+  console.error('\nUsage: dialup register --project <path> --agent <name> --description <desc> --executeMode <true|false>');
   console.error('\nExamples:');
   console.error('  dialup register --project . --agent my-api --description "REST API" --executeMode false');
-  console.error('  dialup register --project /path/to/project --agent my-api --description "REST API" --executeMode Write,Edit');
-  console.error('  dialup register --project . --agent my-api --description "REST API" --executeMode Bash,Write,Edit --systemPrompt "Focus on API layer"');
+  console.error('  dialup register --project . --agent workspace --description "Browser automation" --executeMode true');
+  console.error('  dialup register --project . --agent my-api --description "REST API" --executeMode true --systemPrompt "Focus on API layer"');
+  console.error('  dialup register --project . --agent my-api --description "REST API" --executeMode false --model haiku');
 }
 
 export async function handleRegister(args: string[]): Promise<void> {
   const parsed = parseArgs(args);
 
   // Build config object and validate via schema
-  const configObj: Record<string, string | string[] | false> = {
+  const configObj: Record<string, string | boolean> = {
     agent: parsed.agent,
     description: parsed.description,
     executeMode: parsed.executeMode,
+    model: parsed.model,
   };
   if (parsed.systemPrompt) {
     configObj.systemPrompt = parsed.systemPrompt;
@@ -108,4 +117,13 @@ export async function handleRegister(args: string[]): Promise<void> {
   // Register in central registry
   await registerAgent(parsed.agent, parsed.project);
   console.log(`Registered '${parsed.agent}' in central registry`);
+
+  // Notify running daemon (best effort — daemon may not be running)
+  try {
+    await notifyDaemon(parsed.agent, parsed.project);
+    console.log(`Notified running daemon about '${parsed.agent}'`);
+  } catch {
+    console.log('Daemon not running — it will pick up the agent on next start');
+  }
 }
+

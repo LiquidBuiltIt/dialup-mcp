@@ -1,30 +1,39 @@
 import * as p from '@clack/prompts';
 import { basename } from 'node:path';
-import { EXECUTE_TOOLS } from '../shared/types.js';
-import type { ExecuteTool } from '../shared/types.js';
+import { AGENT_MODELS } from '../shared/types.js';
+import type { AgentModel } from '../shared/types.js';
 
 export interface WizardResult {
   projectDir: string;
   agent: string;
   description: string;
   systemPrompt?: string;
-  executeMode: false | ExecuteTool[];
+  executeMode: boolean;
+  model: AgentModel;
 }
 
 export async function runWizard(discoveredProjects: string[]): Promise<WizardResult[]> {
-  const selected = await p.multiselect({
-    message: 'Select projects to enable as dialup agents',
-    options: discoveredProjects.map((dir) => ({
-      value: dir,
-      label: basename(dir),
-      hint: dir,
-    })),
-    required: true,
-  });
+  let selected: string[];
 
-  if (p.isCancel(selected)) {
-    p.cancel('Setup cancelled.');
-    process.exit(0);
+  if (discoveredProjects.length === 1) {
+    // Skip multiselect when there's only one project — no point asking
+    selected = discoveredProjects;
+  } else {
+    const chosen = await p.multiselect({
+      message: 'Select projects to enable as dialup agents',
+      options: discoveredProjects.map((dir) => ({
+        value: dir,
+        label: basename(dir),
+        hint: dir,
+      })),
+      required: true,
+    });
+
+    if (p.isCancel(chosen)) {
+      p.cancel('Setup cancelled.');
+      process.exit(0);
+    }
+    selected = chosen;
   }
 
   const results: WizardResult[] = [];
@@ -65,26 +74,26 @@ export async function runWizard(discoveredProjects: string[]): Promise<WizardRes
       },
     );
 
-    let executeMode: false | ExecuteTool[] = false;
     const enableExecute = await p.confirm({
-      message: 'Enable execute mode? (allows other agents to run tools in this project)',
+      message: 'Enable execute mode? (allows other agents to request tools in this project)',
       initialValue: false,
     });
     if (p.isCancel(enableExecute)) {
       p.cancel('Setup cancelled.');
       process.exit(0);
     }
-    if (enableExecute) {
-      const selectedTools = await p.multiselect({
-        message: 'Which executive tools should remote agents be allowed to use?',
-        options: EXECUTE_TOOLS.map((tool) => ({ value: tool, label: tool })),
-        required: true,
-      });
-      if (p.isCancel(selectedTools)) {
-        p.cancel('Setup cancelled.');
-        process.exit(0);
-      }
-      executeMode = selectedTools as ExecuteTool[];
+
+    const model = await p.select({
+      message: 'Model to use for this agent',
+      options: AGENT_MODELS.map((m) => ({
+        value: m,
+        label: m === 'default' ? 'default (uses your configured default)' : m,
+      })),
+      initialValue: 'haiku' as AgentModel,
+    });
+    if (p.isCancel(model)) {
+      p.cancel('Setup cancelled.');
+      process.exit(0);
     }
 
     results.push({
@@ -92,7 +101,8 @@ export async function runWizard(discoveredProjects: string[]): Promise<WizardRes
       agent: config.agent,
       description: config.description,
       systemPrompt: config.systemPrompt || undefined,
-      executeMode,
+      executeMode: enableExecute as boolean,
+      model: model as AgentModel,
     });
   }
 

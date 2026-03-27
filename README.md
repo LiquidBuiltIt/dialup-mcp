@@ -9,7 +9,7 @@ dialup gives your Claude Code agents a walkie-talkie. Agent A (working on your A
 Two modes of operation:
 
 - **`ask_agent_readonly`** — Read-only oracle mode. The target agent reads its codebase and answers questions. Can't modify anything.
-- **`ask_agent_execute`** — Collaborator mode. The target agent can read, write, and edit files in its project. Scoped by a per-project tool whitelist. Destructive operations (deletion, git commits/pushes) are blocked at the tool level.
+- **`ask_agent_execute`** — Collaborator mode. The requesting agent specifies which tools and/or MCP servers to enable per-request. Use `list_agents` to discover available capabilities first. Destructive operations (deletion, git commits/pushes) are blocked at the tool level.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ The setup wizard:
 1. Scans for projects with `CLAUDE.md` files
 2. Lets you select which projects to enable as agents
 3. Prompts for agent name, description, and optional system prompt
-4. Asks whether to enable execute mode and which tools to whitelist
+4. Asks whether to enable execute mode (boolean gate — tool selection happens per-request)
 5. Writes `.dialup.config.json` to each project and registers them centrally
 
 ### Programmatic (agents / CI)
@@ -57,10 +57,10 @@ With execute mode enabled:
 ```bash
 npx dialup-mcp -- register \
   --project . \
-  --agent my-api \
-  --description "REST API" \
-  --executeMode Write,Edit \
-  --systemPrompt "Focus on the API layer"
+  --agent workspace \
+  --description "Browser automation workspace" \
+  --executeMode true \
+  --systemPrompt "Focus on browser automation tasks"
 ```
 
 | Flag | Required | Description |
@@ -68,8 +68,9 @@ npx dialup-mcp -- register \
 | `--project` | Yes | Path to the project directory |
 | `--agent` | Yes | Agent name (unique identifier) |
 | `--description` | Yes | What this agent/project does |
-| `--executeMode` | Yes | `false` or comma-separated tools: `Bash,Write,Edit,NotebookEdit` |
+| `--executeMode` | Yes | `true` or `false` — enables/disables execute mode. Tool selection is dynamic per-request. |
 | `--systemPrompt` | No | Custom system prompt for this agent |
+| `--model` | No | Agent model: `default`, `haiku`, `sonnet`, `opus` (defaults to `haiku`) |
 
 ### Daemon Management
 
@@ -103,26 +104,16 @@ Each enabled project gets a `.dialup.config.json` in its root:
 
 ### `executeMode`
 
-Controls what the agent can do when contacted via `ask_agent_execute`:
+A boolean gate that controls whether the agent accepts execute-mode requests:
 
-```json
-"executeMode": false
-```
-Execute mode disabled. Agent is read-only only.
+- **`false`** — Agent is read-only. Only `ask_agent_readonly` works.
+- **`true`** — Agent accepts `ask_agent_execute` requests. The *requesting* agent specifies which tools to enable per-request (not declared upfront in config).
 
-```json
-"executeMode": ["Write", "Edit"]
-```
-Agent can create and modify files when contacted in execute mode.
+Tool selection is dynamic — the requesting agent discovers capabilities via `list_agents`, then passes the specific `tools` and/or `servers` it wants enabled when calling `ask_agent_execute`.
 
-```json
-"executeMode": ["Bash", "Write", "Edit"]
-```
-Agent can also run commands (tests, builds, etc). Destructive Bash commands (`rm`, `rmdir`, `git commit`, `git push`, `git reset`) are always blocked regardless of whitelist.
+### `.mcp.json`
 
-**Valid tools**: `Bash`, `Write`, `Edit`, `NotebookEdit`
-
-Read-only tools (`Read`, `Glob`, `Grep`) are always available and don't need to be specified.
+If a project has a `.mcp.json` file (standard MCP server config), dialup introspects those servers to discover available MCP tools. These appear in the `capabilities` field of `list_agents` responses, grouped by server name.
 
 ## Security Model
 
@@ -134,7 +125,7 @@ Read-only tools (`Read`, `Glob`, `Grep`) are always available and don't need to 
 
 ### Execute Mode (`ask_agent_execute`)
 
-- Tools: Read-only baseline + whitelisted tools from `executeMode`
+- Tools: Read-only baseline + tools specified per-request via `tools` and/or `servers` params
 - **Hard-blocked** (via `--disallowedTools`, enforced at tool level):
   - `rm`, `rmdir` — no file/directory deletion
   - `git commit`, `git push`, `git reset`, `git checkout --`, `git clean` — no git write operations
@@ -152,11 +143,53 @@ The calling agent is always treated as untrusted. The target agent:
 
 ## MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `list_agents` | List all registered agents with their descriptions |
-| `ask_agent_readonly` | Read-only query to another agent |
-| `ask_agent_execute` | Request with execution privileges (requires `executeMode` config on target) |
+### `list_agents`
+
+List all registered agents with their descriptions and capabilities.
+
+Response includes per-agent capability breakdown:
+
+```json
+{
+  "agent": "workspace",
+  "description": "Browser automation workspace",
+  "project": "/path/to/workspace",
+  "executeEnabled": true,
+  "capabilities": {
+    "builtIn": ["Bash", "Write", "Edit", "NotebookEdit"],
+    "supersurf": ["mcp__supersurf__connect", "mcp__supersurf__browser_navigate", "..."]
+  }
+}
+```
+
+- `builtIn` — always present for execute-enabled agents (`Bash`, `Write`, `Edit`, `NotebookEdit`)
+- MCP server entries — one key per server in the target's `.mcp.json`, with the full list of `mcp__<server>__<tool>` names
+
+### `ask_agent_readonly`
+
+Read-only query to another agent. Target can read its codebase but cannot modify anything.
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `agent` | string | Yes | Target agent name |
+| `message` | string | Yes | Question or message |
+| `followUp` | boolean | No | Include previous conversation history |
+| `files` | string[] | No | File paths to send for review |
+
+### `ask_agent_execute`
+
+Request with execution privileges. The requesting agent specifies which tools to enable. Use `list_agents` to discover available capabilities first.
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `agent` | string | Yes | Target agent name |
+| `message` | string | Yes | Request or instruction |
+| `tools` | string[] | No | Individual tools to enable (e.g. `["Bash", "Write", "mcp__supersurf__browser_navigate"]`) |
+| `servers` | string[] | No | MCP server names — grants access to all tools from those servers (e.g. `["supersurf"]`) |
+| `followUp` | boolean | No | Include previous conversation history |
+| `files` | string[] | No | File paths to send to the target |
+
+At least one of `tools` or `servers` must be provided. Both can be used together — they're merged and deduplicated.
 
 ## Development
 

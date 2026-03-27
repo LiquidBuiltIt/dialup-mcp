@@ -25,8 +25,22 @@ async function getDaemonPid(): Promise<number | null> {
 async function stopDaemon(): Promise<boolean> {
   const pid = await getDaemonPid();
   if (!pid) return false;
+
   process.kill(pid, 'SIGTERM');
-  // Clean up stale files
+
+  // Poll until the process is actually dead (up to 10s)
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0); // Check if still alive
+      await new Promise((r) => setTimeout(r, 200));
+    } catch {
+      // Process is dead
+      break;
+    }
+  }
+
+  // Clean up stale files (daemon should have done this, but belt-and-suspenders)
   try { await unlink(DAEMON_SOCKET_PATH); } catch { /* best effort */ }
   try { await unlink(DAEMON_PID_FILE); } catch { /* best effort */ }
   return true;
@@ -101,8 +115,6 @@ export async function handleService(action: string): Promise<void> {
     }
     case 'restart': {
       await stopDaemon();
-      // Brief pause to let socket release
-      await new Promise((r) => setTimeout(r, 500));
       try {
         await startDaemon();
         console.log('Daemon restarted');

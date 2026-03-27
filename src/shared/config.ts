@@ -2,16 +2,17 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { CONFIG_FILENAME } from './constants.js';
-import { EXECUTE_TOOLS } from './types.js';
+import { AGENT_MODELS } from './types.js';
 import type { DialupConfig } from './types.js';
 
-const ExecuteToolSchema = z.enum(EXECUTE_TOOLS);
+const AgentModelSchema = z.enum(AGENT_MODELS);
 
 export const DialupConfigSchema = z.object({
   agent: z.string().min(1),
   description: z.string().min(1),
   systemPrompt: z.string().optional(),
-  executeMode: z.union([z.literal(false), z.array(ExecuteToolSchema)]),
+  executeMode: z.boolean(),
+  model: AgentModelSchema.default('haiku'),
 });
 
 export function parseDialupConfig(raw: unknown): DialupConfig {

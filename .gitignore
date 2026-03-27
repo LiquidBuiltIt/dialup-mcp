@@ -3,3 +3,8 @@ dist/
 *.tsbuildinfo
 CLAUDE.md
 .mcp.json
+.claude
+.workspace
+.dialup.config.json
+docs/
+github-repos/

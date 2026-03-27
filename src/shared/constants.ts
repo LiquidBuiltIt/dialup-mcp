@@ -11,3 +11,7 @@ export const DAEMON_TTL_MS = 180_000;            // 3 minutes
 
 export const CONFIG_FILENAME = '.dialup.config.json';
 export const REGISTRY_FILE = join(DIALUP_DIR, 'registry.json');
+
+export const INBOX_DIRNAME = '.dialup-inbox';
+
+export const SHUTDOWN_GRACE_MS = 5_000;  // 5 seconds grace period for in-flight requests

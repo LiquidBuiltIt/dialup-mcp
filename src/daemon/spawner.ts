@@ -1,5 +1,11 @@
 import { spawn } from 'node:child_process';
-import type { AgentMode, ExecuteTool } from '../shared/types.js';
+import type { AgentMode, AgentModel, TokenUsage } from '../shared/types.js';
+import type { ProcessRegistry } from './process-registry.js';
+
+export interface SpawnResult {
+  response: string;
+  usage?: TokenUsage;
+}
 
 export const TRUST_ZERO_PROMPT = `You are being contacted by another Claude Code agent via the dialup.io inter-agent communication system. You are operating as a knowledge oracle for your project.
 
@@ -46,7 +52,7 @@ const ORACLE_TOOLS = ['Read', 'Glob', 'Grep'];
 
 // Hardcoded deny patterns — these are always blocked in execute mode regardless of whitelist.
 // Deny takes precedence over allow in Claude Code's permission model.
-const DISALLOWED_PATTERNS = [
+export const DISALLOWED_PATTERNS = [
   'Bash(rm *)',
   'Bash(rm -*)',
   'Bash(rmdir *)',
@@ -63,6 +69,7 @@ export interface ComposeSystemPromptOpts {
   senderAgent?: string;
   senderProject?: string;
   availableTools?: string[];
+  inboxDir?: string;
 }
 
 export function composeSystemPrompt(opts: ComposeSystemPromptOpts): string {
@@ -78,8 +85,13 @@ export function composeSystemPrompt(opts: ComposeSystemPromptOpts): string {
   }
 
   if (opts.systemPrompt) {
-    return `${base}\n\n${opts.systemPrompt}`;
+    base = `${base}\n\n${opts.systemPrompt}`;
   }
+
+  if (opts.inboxDir) {
+    base = `${base}\n\nFILE INBOX: The requesting agent has sent you files. They are staged at: ${opts.inboxDir}\nUse your Read and Glob tools to inspect them as needed. These files are temporary and will be removed after you respond.`;
+  }
+
   return base;
 }
 
@@ -92,28 +104,93 @@ export function composeMessage(opts: { conversationHistory?: string; message: st
   return parts.join('\n\n');
 }
 
-const SPAWN_TIMEOUT_MS = 600_000; // 10 minutes
+// No timeout — agents run until they finish or the daemon dies
 
-export function spawnClaude(projectDir: string, systemPrompt: string, message: string, mode?: AgentMode, executeTools?: ExecuteTool[]): Promise<string> {
+export interface BuildSpawnArgsOpts {
+  systemPrompt: string;
+  tools: string[];
+  mode?: AgentMode;
+  model?: AgentModel;
+  mcpConfigJson?: string;
+}
+
+export function buildSpawnArgs(opts: BuildSpawnArgsOpts): string[] {
+  const args = [
+    '--print',
+    '--output-format', 'json',
+    '--system-prompt', opts.systemPrompt,
+    '--allowedTools', opts.tools.join(','),
+  ];
+
+  if (opts.model && opts.model !== 'default') {
+    args.push('--model', opts.model);
+  }
+
+  if (opts.mode === 'execute') {
+    for (const pattern of DISALLOWED_PATTERNS) {
+      args.push('--disallowedTools', pattern);
+    }
+  }
+
+  if (opts.mcpConfigJson) {
+    args.push('--mcp-config', opts.mcpConfigJson);
+  }
+
+  return args;
+}
+
+export function validateSpawnResult(stdout: string, stderr: string, exitCode: number | null): SpawnResult {
+  const trimmedOut = stdout.trim();
+  const trimmedErr = stderr.trim();
+
+  if (exitCode !== 0) {
+    const errMsg = trimmedErr || trimmedOut || `Process exited with code ${exitCode}`;
+    throw new Error(`Agent failed to respond: ${errMsg}`);
+  }
+
+  if (!trimmedOut) {
+    const diagnostics = trimmedErr ? ` (stderr: ${trimmedErr})` : '';
+    throw new Error(`Agent returned empty response — claude --print exited 0 but produced no output${diagnostics}`);
+  }
+
+  // Parse JSON output format
+  try {
+    const parsed = JSON.parse(trimmedOut);
+    const response = parsed.result ?? '';
+    if (!response.trim()) {
+      const diagnostics = trimmedErr ? ` (stderr: ${trimmedErr})` : '';
+      throw new Error(`Agent returned empty response — claude --print exited 0 but result field is empty${diagnostics}`);
+    }
+
+    const usage: TokenUsage | undefined = parsed.usage
+      ? { inputTokens: (parsed.usage.input_tokens ?? 0) + (parsed.usage.cache_creation_input_tokens ?? 0) + (parsed.usage.cache_read_input_tokens ?? 0), outputTokens: parsed.usage.output_tokens ?? 0 }
+      : undefined;
+
+    return { response: response.trim(), usage };
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      // Not JSON — fall back to raw text (shouldn't happen with --output-format json, but be defensive)
+      return { response: trimmedOut };
+    }
+    throw err;
+  }
+}
+
+export function spawnClaude(projectDir: string, systemPrompt: string, message: string, mode?: AgentMode, executeTools?: string[], model?: AgentModel, registry?: ProcessRegistry, mcpConfigJson?: string): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
-    const args = [
-      '--print',
-      '--system-prompt', systemPrompt,
-    ];
-
     // Oracle mode: read-only tools only
     // Execute mode: read-only tools + whitelisted executive tools
     const tools = mode === 'execute' && executeTools?.length
       ? [...ORACLE_TOOLS, ...executeTools]
       : ORACLE_TOOLS;
-    args.push('--allowedTools', tools.join(','));
 
-    // In execute mode, enforce hardcoded deny patterns for destructive operations
-    if (mode === 'execute') {
-      for (const pattern of DISALLOWED_PATTERNS) {
-        args.push('--disallowedTools', pattern);
-      }
-    }
+    const args = buildSpawnArgs({
+      systemPrompt,
+      tools,
+      mode,
+      model,
+      mcpConfigJson,
+    });
 
     // Strip Claude Code session env vars so spawned claude authenticates fresh
     const cleanEnv = { ...process.env };
@@ -133,32 +210,32 @@ export function spawnClaude(projectDir: string, systemPrompt: string, message: s
       env: cleanEnv,
     });
 
+    if (registry) registry.register(child);
+
     let stdout = '';
     let stderr = '';
 
     child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
     child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
 
-    const timeout = setTimeout(() => {
-      child.kill('SIGTERM');
-      reject(new Error('Agent timed out after 120 seconds'));
-    }, SPAWN_TIMEOUT_MS);
-
     child.on('close', (code) => {
-      clearTimeout(timeout);
-      if (code !== 0) {
-        console.error(`[dialup-daemon] claude --print exited with code ${code}`);
-        if (stderr) console.error(`[dialup-daemon] stderr: ${stderr}`);
-        if (stdout) console.error(`[dialup-daemon] stdout: ${stdout}`);
-        const errMsg = stderr.trim() || stdout.trim() || `Process exited with code ${code}`;
-        reject(new Error(`Agent failed to respond: ${errMsg}`));
-      } else {
-        resolve(stdout.trim());
+      if (registry) registry.deregister(child);
+
+      // Always log stderr for diagnostics
+      if (stderr.trim()) {
+        console.error(`[dialup-daemon] claude --print stderr: ${stderr.trim()}`);
+      }
+
+      try {
+        const result = validateSpawnResult(stdout, stderr, code);
+        resolve(result);
+      } catch (err) {
+        reject(err as Error);
       }
     });
 
     child.on('error', (err) => {
-      clearTimeout(timeout);
+      if (registry) registry.deregister(child);
       reject(new Error(`Failed to spawn claude: ${err.message}`));
     });
 

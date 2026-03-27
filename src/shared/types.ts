@@ -3,14 +3,29 @@
 export const EXECUTE_TOOLS = ['Bash', 'Write', 'Edit', 'NotebookEdit'] as const;
 export type ExecuteTool = typeof EXECUTE_TOOLS[number];
 
+// MCP tools follow the pattern: mcp__<server>__<tool>
+export const MCP_TOOL_PATTERN = /^mcp__[a-zA-Z0-9_-]+__[a-zA-Z0-9_-]+$/;
+
+// --- Model ---
+
+export const AGENT_MODELS = ['default', 'haiku', 'sonnet', 'opus'] as const;
+export type AgentModel = typeof AGENT_MODELS[number];
+
 // --- Config ---
 
 export interface DialupConfig {
   agent: string;
   description: string;
   systemPrompt?: string;
-  executeMode: false | ExecuteTool[];
+  executeMode: boolean;
+  model: AgentModel;
 }
+
+// --- Agent Capabilities ---
+// Keys: "builtIn" for built-in tools, MCP server names for their tools
+// Values: arrays of tool name strings
+
+export type AgentCapabilities = Record<string, string[]>;
 
 // --- Agent Info (returned by list_agents) ---
 
@@ -18,6 +33,8 @@ export interface AgentInfo {
   project: string;
   agent: string;
   description: string;
+  executeEnabled: boolean;
+  capabilities: AgentCapabilities;
 }
 
 // --- Conversation ---
@@ -79,11 +96,20 @@ export interface AskAgentParams {
   message: string;
   followUp?: boolean;
   mode?: AgentMode;
+  files?: string[];
+  tools?: string[];    // Individual tool names for execute mode
+  servers?: string[];  // MCP server names — grants all tools from these servers
+}
+
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
 }
 
 export interface AskAgentResult {
   response: string;
   sessionId: string;
+  usage?: TokenUsage;
 }
 
 export interface RegisterAgentParams {

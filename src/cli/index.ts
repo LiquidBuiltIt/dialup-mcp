@@ -37,27 +37,48 @@ async function main(): Promise<void> {
     console.log('  --project <path>         Project directory (required)');
     console.log('  --agent <name>           Agent name (required)');
     console.log('  --description <desc>     Agent description (required)');
-    console.log('  --executeMode <mode>     "false" or comma-separated tools: Bash,Write,Edit,NotebookEdit (required)');
+    console.log('  --executeMode <mode>     "true" or "false" — enable/disable execute mode (required)');
     console.log('  --systemPrompt <prompt>  Custom system prompt (optional)');
+    console.log('  --model <model>          Agent model: default, haiku, sonnet, opus (optional, defaults to "haiku")');
     process.exit(0);
   }
 
   p.intro('dialup-mcp setup');
 
-  const s = p.spinner();
-  s.start('Scanning for Claude Code projects...');
+  const cwd = process.cwd();
+  const setupMode = await p.select({
+    message: 'How would you like to set up dialup?',
+    options: [
+      { value: 'cwd', label: `Current directory (${cwd})` },
+      { value: 'search', label: 'Search for existing Claude Code projects' },
+    ],
+  });
 
-  const roots = getDefaultSearchRoots();
-  const projects = await discoverProjects(roots);
-
-  if (projects.length === 0) {
-    s.stop('No projects found');
-    p.log.warn('No Claude Code projects found (no CLAUDE.md files detected).');
-    p.outro('Nothing to do.');
+  if (p.isCancel(setupMode)) {
+    p.cancel('Setup cancelled.');
     process.exit(0);
   }
 
-  s.stop(`Found ${projects.length} project(s)`);
+  let projects: string[];
+
+  if (setupMode === 'cwd') {
+    projects = [cwd];
+  } else {
+    const s = p.spinner();
+    s.start('Scanning for Claude Code projects...');
+
+    const roots = getDefaultSearchRoots();
+    projects = await discoverProjects(roots);
+
+    if (projects.length === 0) {
+      s.stop('No projects found');
+      p.log.warn('No Claude Code projects found (no CLAUDE.md files detected).');
+      p.outro('Nothing to do.');
+      process.exit(0);
+    }
+
+    s.stop(`Found ${projects.length} project(s)`);
+  }
 
   const results = await runWizard(projects);
 

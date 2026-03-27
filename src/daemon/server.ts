@@ -1,6 +1,6 @@
 import * as net from 'node:net';
 import { mkdir, unlink, writeFile, readFile, access } from 'node:fs/promises';
-import { DIALUP_DIR, DAEMON_SOCKET_PATH, DAEMON_PID_FILE } from '../shared/constants.js';
+import { DIALUP_DIR, DAEMON_SOCKET_PATH, DAEMON_PID_FILE, SHUTDOWN_GRACE_MS } from '../shared/constants.js';
 import type {
   JsonRpcRequest,
   JsonRpcResponse,
@@ -9,15 +9,21 @@ import type {
   RegisterAgentParams,
   ListAgentsResult,
   AgentInfo,
+  AgentCapabilities,
   DialupConfig,
 } from '../shared/types.js';
-import { loadRegistry } from '../shared/registry.js';
+import { EXECUTE_TOOLS, MCP_TOOL_PATTERN } from '../shared/types.js';
+import { loadRegistry, saveRegistry } from '../shared/registry.js';
+import { discoverDialupConfigs, getDefaultSearchRoots } from '../cli/discovery.js';
 import { loadDialupConfig } from '../shared/config.js';
 import { createMessageParser, serializeMessage, buildSuccessResponse, buildErrorResponse } from '../shared/protocol.js';
+import { readMcpJson, introspectAllServers, buildFilteredMcpConfigJson } from '../shared/mcp-introspect.js';
 import { ConversationManager } from './conversations.js';
 import { AgentQueue } from './queue.js';
 import { HeartbeatTracker } from './heartbeat.js';
 import { composeSystemPrompt, composeMessage, spawnClaude } from './spawner.js';
+import { ProcessRegistry } from './process-registry.js';
+import { stageFiles, cleanupInbox } from './inbox.js';
 
 interface ResolvedAgent extends DialupConfig {
   project: string;
@@ -26,9 +32,12 @@ interface ResolvedAgent extends DialupConfig {
 export class DaemonServer {
   private server: net.Server | null = null;
   private agentRegistry = new Map<string, ResolvedAgent>();
+  private capabilitiesCache = new Map<string, AgentCapabilities>();
   private conversationManager = new ConversationManager();
   private agentQueue = new AgentQueue();
+  private processRegistry = new ProcessRegistry();
   private heartbeatTracker: HeartbeatTracker;
+  private shuttingDown = false;
 
   constructor() {
     this.heartbeatTracker = new HeartbeatTracker(() => this.shutdown());
@@ -53,18 +62,42 @@ export class DaemonServer {
     // Write PID file
     await writeFile(DAEMON_PID_FILE, process.pid.toString());
 
-    // Load persistent agent registry — registry maps name → project path,
-    // config is read from each project's .dialup.config.json (single source of truth)
+    // Load persistent agent registry
     const registry = await loadRegistry();
     for (const [agent, projectDir] of Object.entries(registry)) {
       const config = await loadDialupConfig(projectDir);
       if (!config) {
-        console.error(`[dialup-daemon] Skipping agent '${agent}': no .dialup.config.json found at ${projectDir}`);
+        console.error(`[dialup-daemon] Pruning stale agent '${agent}': no .dialup.config.json at ${projectDir}`);
+        delete registry[agent];
         continue;
       }
       this.agentRegistry.set(agent, { ...config, project: projectDir });
     }
-    console.error(`[dialup-daemon] Loaded ${this.agentRegistry.size} agent(s) from registry`);
+
+    // Auto-discover unregistered agents
+    let discoveredCount = 0;
+    try {
+      const discovered = await discoverDialupConfigs(getDefaultSearchRoots());
+      for (const { agent, projectDir } of discovered) {
+        if (this.agentRegistry.has(agent)) continue; // Already registered
+        const config = await loadDialupConfig(projectDir);
+        if (!config) continue;
+        this.agentRegistry.set(agent, { ...config, project: projectDir });
+        registry[agent] = projectDir;
+        discoveredCount++;
+        console.error(`[dialup-daemon] Auto-discovered agent '${agent}' at ${projectDir}`);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[dialup-daemon] Discovery scan failed (non-fatal): ${msg}`);
+    }
+
+    // Persist updated registry (new discoveries + pruned stale entries)
+    if (discoveredCount > 0 || Object.keys(registry).length !== this.agentRegistry.size) {
+      await saveRegistry(registry);
+    }
+
+    console.error(`[dialup-daemon] Loaded ${this.agentRegistry.size} agent(s) (${discoveredCount} newly discovered)`);
 
     // Start TTL timer — first heartbeat must arrive within TTL
     this.heartbeatTracker.ping();
@@ -133,12 +166,18 @@ export class DaemonServer {
   }
 
   private async handleRequest(socket: net.Socket, request: JsonRpcRequest): Promise<void> {
+    if (this.shuttingDown) {
+      const response = buildErrorResponse(request.id, -32000, 'Daemon is shutting down');
+      try { socket.write(serializeMessage(response)); } catch { /* socket may be closed */ }
+      return;
+    }
+
     let response: JsonRpcResponse;
 
     try {
       switch (request.method) {
         case 'dialup.listAgents':
-          response = this.handleListAgents(request);
+          response = await this.handleListAgents(request);
           break;
         case 'dialup.askAgent':
           response = await this.handleAskAgent(request);
@@ -164,14 +203,44 @@ export class DaemonServer {
     }
   }
 
-  private handleListAgents(request: JsonRpcRequest): JsonRpcResponse {
-    const agents: AgentInfo[] = Array.from(this.agentRegistry.values()).map((r) => ({
-      project: r.project,
-      agent: r.agent,
-      description: r.description,
-    }));
+  private async handleListAgents(request: JsonRpcRequest): Promise<JsonRpcResponse> {
+    const agents: AgentInfo[] = [];
+    for (const r of this.agentRegistry.values()) {
+      const capabilities = await this.getCapabilities(r);
+      agents.push({
+        project: r.project,
+        agent: r.agent,
+        description: r.description,
+        executeEnabled: r.executeMode,
+        capabilities,
+      });
+    }
     const result: ListAgentsResult = { agents };
     return buildSuccessResponse(request.id, result);
+  }
+
+  private async getCapabilities(agent: ResolvedAgent): Promise<AgentCapabilities> {
+    if (!agent.executeMode) return {};
+
+    // Return cached if available
+    const cached = this.capabilitiesCache.get(agent.project);
+    if (cached) return cached;
+
+    // Build capabilities: builtIn tools + introspect MCP servers
+    const capabilities: AgentCapabilities = {
+      builtIn: [...EXECUTE_TOOLS],
+    };
+
+    const mcpJson = await readMcpJson(agent.project);
+    if (mcpJson) {
+      const serverTools = await introspectAllServers(mcpJson);
+      for (const [server, tools] of Object.entries(serverTools)) {
+        capabilities[server] = tools;
+      }
+    }
+
+    this.capabilitiesCache.set(agent.project, capabilities);
+    return capabilities;
   }
 
   private async handleAskAgent(request: JsonRpcRequest): Promise<JsonRpcResponse> {
@@ -191,53 +260,132 @@ export class DaemonServer {
 
     const mode = params.mode ?? 'oracle';
 
-    // Reject execute mode if target agent hasn't whitelisted any executive tools
-    // executeMode: undefined = never configured, false = explicitly disabled, [] = empty whitelist
-    if (mode === 'execute' && (!targetConfig.executeMode || !Array.isArray(targetConfig.executeMode) || targetConfig.executeMode.length === 0)) {
+    // Reject execute mode if target agent hasn't enabled it
+    if (mode === 'execute' && !targetConfig.executeMode) {
       return buildErrorResponse(
         request.id, -32003,
-        `Agent '${params.targetAgent}' does not have executeMode configured. Add "executeMode" to its .dialup.config.json to enable execution.`,
+        `Agent '${params.targetAgent}' does not have execute mode enabled. Set "executeMode": true in its .dialup.config.json.`,
+      );
+    }
+
+    // Reject execute mode without tools or servers
+    if (mode === 'execute' && (!params.tools?.length && !params.servers?.length)) {
+      return buildErrorResponse(
+        request.id, -32602,
+        `Execute mode requires "tools" and/or "servers" specifying which tools to enable. Use list_agents to discover available capabilities.`,
       );
     }
 
     const result = await this.agentQueue.enqueue<AskAgentResult>(params.targetAgent, async () => {
-      // Get or create conversation session
-      const sessionId = this.conversationManager.getOrCreateSession(params.senderAgent, params.targetAgent);
-
-      // Build system prompt (mode determines oracle vs collaborator prompt)
-      const executeTools = Array.isArray(targetConfig.executeMode) ? targetConfig.executeMode : undefined;
-      const allTools = mode === 'execute' && executeTools?.length
-        ? ['Read', 'Glob', 'Grep', ...executeTools]
-        : ['Read', 'Glob', 'Grep'];
-      const systemPrompt = composeSystemPrompt({
-        systemPrompt: targetConfig.systemPrompt,
-        mode,
-        senderAgent: params.senderAgent,
-        senderProject: params.senderProject,
-        availableTools: allTools,
-      });
-
-      // Build message with optional conversation history
-      let conversationHistory: string | undefined;
-      if (params.followUp) {
-        const history = this.conversationManager.formatHistoryForPrompt(sessionId);
-        if (history) conversationHistory = history;
+      // Stage files into target's inbox (if any)
+      let inboxDir: string | null = null;
+      if (params.files?.length) {
+        inboxDir = await stageFiles(params.senderProject, targetConfig.project, params.files);
+        console.error(`[dialup-daemon] Staged ${params.files.length} file(s) to ${inboxDir}`);
       }
-      const message = composeMessage({ conversationHistory, message: params.message });
 
-      // Spawn claude (executeMode is guaranteed to be a valid array here if mode=execute, guarded above)
-      const response = await spawnClaude(targetConfig.project, systemPrompt, message, mode, executeTools);
+      try {
+        // Get or create conversation session
+        const sessionId = this.conversationManager.getOrCreateSession(params.senderAgent, params.targetAgent);
 
-      // Record the exchange
-      await this.conversationManager.addExchange(sessionId, {
-        sender: params.senderAgent,
-        message: params.message,
-        responder: params.targetAgent,
-        response,
-        timestamp: new Date().toISOString(),
-      });
+        // Resolve tools for this request
+        let executeTools: string[] | undefined;
+        let mcpConfigJson: string | undefined;
 
-      return { response, sessionId };
+        if (mode === 'execute') {
+          const capabilities = await this.getCapabilities(targetConfig);
+          const allCapTools = new Set(Object.values(capabilities).flat());
+          const allCapServers = new Set(Object.keys(capabilities).filter((k) => k !== 'builtIn'));
+
+          // Validate individual tools
+          const resolvedTools = new Set<string>();
+          if (params.tools?.length) {
+            for (const tool of params.tools) {
+              if (!allCapTools.has(tool)) {
+                throw new Error(`Tool "${tool}" is not available on agent '${params.targetAgent}'. Use list_agents to see available capabilities.`);
+              }
+              resolvedTools.add(tool);
+            }
+          }
+
+          // Expand servers into all their tools
+          if (params.servers?.length) {
+            for (const server of params.servers) {
+              if (!allCapServers.has(server)) {
+                throw new Error(`MCP server "${server}" is not available on agent '${params.targetAgent}'. Available servers: ${[...allCapServers].join(', ') || 'none'}`);
+              }
+              for (const tool of capabilities[server]) {
+                resolvedTools.add(tool);
+              }
+            }
+          }
+
+          executeTools = [...resolvedTools];
+
+          // Build filtered MCP config for the spawned subprocess
+          const mcpJson = await readMcpJson(targetConfig.project);
+          if (mcpJson) {
+            // Extract which MCP servers are needed from the resolved tools
+            const neededServers = new Set<string>();
+            for (const tool of resolvedTools) {
+              if (MCP_TOOL_PATTERN.test(tool)) {
+                const serverName = tool.split('__')[1];
+                neededServers.add(serverName);
+              }
+            }
+            if (neededServers.size > 0) {
+              mcpConfigJson = buildFilteredMcpConfigJson(mcpJson, [...neededServers]);
+            }
+          }
+        }
+
+        const allTools = mode === 'execute' && executeTools?.length
+          ? ['Read', 'Glob', 'Grep', ...executeTools]
+          : ['Read', 'Glob', 'Grep'];
+
+        // Build system prompt (mode determines oracle vs collaborator prompt)
+        const systemPrompt = composeSystemPrompt({
+          systemPrompt: targetConfig.systemPrompt,
+          mode,
+          senderAgent: params.senderAgent,
+          senderProject: params.senderProject,
+          availableTools: allTools,
+          inboxDir: inboxDir ?? undefined,
+        });
+
+        // Build message with optional conversation history
+        let conversationHistory: string | undefined;
+        if (params.followUp) {
+          const history = this.conversationManager.formatHistoryForPrompt(sessionId);
+          if (history) conversationHistory = history;
+        }
+        const message = composeMessage({ conversationHistory, message: params.message });
+
+        // Spawn claude with dynamically resolved tools + MCP config
+        const spawnResult = await spawnClaude(targetConfig.project, systemPrompt, message, mode, executeTools, targetConfig.model, this.processRegistry, mcpConfigJson);
+
+        // Defense-in-depth: reject empty responses even if spawnClaude didn't
+        if (!spawnResult.response.trim()) {
+          throw new Error(`Agent '${params.targetAgent}' returned an empty response`);
+        }
+
+        // Record the exchange (usage stays out of conversation history)
+        await this.conversationManager.addExchange(sessionId, {
+          sender: params.senderAgent,
+          message: params.message,
+          responder: params.targetAgent,
+          response: spawnResult.response,
+          timestamp: new Date().toISOString(),
+        });
+
+        return { response: spawnResult.response, sessionId, usage: spawnResult.usage };
+      } finally {
+        // Always clean up inbox, even on failure/timeout
+        if (inboxDir) {
+          await cleanupInbox(targetConfig.project);
+          console.error(`[dialup-daemon] Cleaned up inbox at ${targetConfig.project}`);
+        }
+      }
     });
 
     return buildSuccessResponse(request.id, result);
@@ -258,22 +406,42 @@ export class DaemonServer {
       return buildErrorResponse(request.id, -32002, `No .dialup.config.json found at ${params.project}`);
     }
     this.agentRegistry.set(params.agent, { ...config, project: params.project });
+    this.capabilitiesCache.delete(params.project); // Force re-introspect on next access
     console.error(`[dialup-daemon] Registered agent: ${params.agent} (${params.project})`);
     return buildSuccessResponse(request.id, { ok: true });
   }
 
   async shutdown(): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+
     console.error('[dialup-daemon] Shutting down...');
     this.heartbeatTracker.stop();
-    await this.conversationManager.wipeAll();
 
+    // 1. Stop accepting new connections
     if (this.server) {
       this.server.close();
     }
 
+    // 2. Kill all spawned child processes
+    const activeCount = this.processRegistry.size;
+    if (activeCount > 0) {
+      console.error(`[dialup-daemon] Killing ${activeCount} active child process(es)...`);
+      this.processRegistry.killAll();
+    }
+
+    // 3. Brief grace period for in-flight request handlers to settle
+    if (activeCount > 0) {
+      console.error(`[dialup-daemon] Waiting up to ${SHUTDOWN_GRACE_MS}ms for cleanup...`);
+      await new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS));
+    }
+
+    // 4. Wipe conversations and clean up files
+    await this.conversationManager.wipeAll();
     try { await unlink(DAEMON_SOCKET_PATH); } catch { /* best effort */ }
     try { await unlink(DAEMON_PID_FILE); } catch { /* best effort */ }
 
+    console.error('[dialup-daemon] Shutdown complete');
     process.exit(0);
   }
 }
