@@ -6,6 +6,8 @@ import { DAEMON_PID_FILE, DAEMON_SOCKET_PATH, DIALUP_DIR } from '../shared/const
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
+import { DaemonClient } from '../mcp/daemon-client.js';
+import type { DaemonStatus } from '../shared/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -78,18 +80,57 @@ async function startDaemon(): Promise<boolean> {
   return true;
 }
 
-export async function handleService(action: string): Promise<void> {
+async function checkActiveJobs(force: boolean): Promise<void> {
+  if (force) return;
+
+  const pid = await getDaemonPid();
+  if (!pid) return; // not running, nothing to check
+
+  try {
+    const client = new DaemonClient();
+    await client.connect();
+    const status = await client.status();
+    await client.disconnect();
+
+    if (status.activeJobs.length > 0) {
+      const jobs = status.activeJobs.map((j) => {
+        const label = j.sessionName ? ` "${j.sessionName}"` : '';
+        return `  → ${j.targetAgent}${label} (running for ${j.runningFor})`;
+      }).join('\n');
+      console.error(`Refusing — ${status.activeJobs.length} active job(s):\n${jobs}\n\nUse --force to override.`);
+      process.exit(1);
+    }
+  } catch {
+    // Can't reach daemon for status — proceed with stop anyway
+  }
+}
+
+export async function handleService(action: string, extraArgs: string[] = []): Promise<void> {
+  const force = extraArgs.includes('--force');
+
   switch (action) {
     case 'status': {
       const pid = await getDaemonPid();
-      if (pid) {
-        console.log(`Daemon running (pid: ${pid})`);
-      } else {
+      if (!pid) {
         console.log('Daemon not running');
+        break;
+      }
+
+      // Try to get rich status from the daemon
+      try {
+        const client = new DaemonClient();
+        await client.connect();
+        const status = await client.status();
+        await client.disconnect();
+        printStatus(status);
+      } catch {
+        // Fallback if daemon doesn't respond to status RPC
+        console.log(`Daemon running (pid: ${pid})`);
       }
       break;
     }
     case 'stop': {
+      await checkActiveJobs(force);
       const stopped = await stopDaemon();
       if (stopped) {
         console.log('Daemon stopped');
@@ -114,6 +155,7 @@ export async function handleService(action: string): Promise<void> {
       break;
     }
     case 'restart': {
+      await checkActiveJobs(force);
       await stopDaemon();
       try {
         await startDaemon();
@@ -125,9 +167,79 @@ export async function handleService(action: string): Promise<void> {
       }
       break;
     }
+    case 'kill': {
+      const targetAgent = extraArgs[0];
+      if (!targetAgent) {
+        console.error('Usage: dialup service kill <agent-name>');
+        process.exit(1);
+      }
+
+      const pid = await getDaemonPid();
+      if (!pid) {
+        console.error('Daemon not running');
+        process.exit(1);
+      }
+
+      try {
+        const client = new DaemonClient();
+        await client.connect();
+        await client.kill(targetAgent);
+        await client.disconnect();
+        console.log(`Killed job for agent: ${targetAgent}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Unknown error';
+        console.error(`Failed to kill: ${msg}`);
+        process.exit(1);
+      }
+      break;
+    }
     default:
       console.error(`Unknown action: ${action}`);
-      console.error('Usage: dialup service <start|stop|restart|status>');
+      console.error('Usage: dialup service <start|stop|restart|status|kill <agent>>');
       process.exit(1);
   }
+}
+
+function printStatus(status: DaemonStatus): void {
+  console.log(`Daemon running (pid: ${status.pid}, uptime: ${status.uptime})`);
+  console.log('');
+
+  // Agents
+  console.log(`Agents (${status.agents.length}):`);
+  if (status.agents.length === 0) {
+    console.log('  (none registered)');
+  } else {
+    for (const a of status.agents) {
+      const mode = a.executeEnabled ? 'execute' : 'read-only';
+      console.log(`  ${a.agent} [${mode}] — ${a.project}`);
+    }
+  }
+
+  // Active jobs
+  console.log('');
+  console.log(`Active jobs (${status.activeJobs.length}):`);
+  if (status.activeJobs.length === 0) {
+    console.log('  (idle)');
+  } else {
+    for (const job of status.activeJobs) {
+      const label = job.sessionName ? ` "${job.sessionName}"` : '';
+      console.log(`  → ${job.targetAgent}${label} (running for ${job.runningFor})`);
+    }
+  }
+
+  // Sessions
+  console.log('');
+  console.log(`Sessions (${status.sessions.length}):`);
+  if (status.sessions.length === 0) {
+    console.log('  (none)');
+  } else {
+    for (const s of status.sessions) {
+      const label = s.sessionName ? ` "${s.sessionName}"` : '';
+      console.log(`  ${s.sender} → ${s.recipient}${label} (${s.exchanges} exchange${s.exchanges !== 1 ? 's' : ''})`);
+    }
+  }
+
+  // Processes
+  console.log('');
+  console.log(`Spawned processes: ${status.activeProcesses}`);
 }

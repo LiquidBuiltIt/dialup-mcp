@@ -15,10 +15,10 @@ async function main(): Promise<void> {
   if (command === 'service') {
     const action = args[1];
     if (!action) {
-      console.error('Usage: dialup service <start|stop|restart|status>');
+      console.error('Usage: dialup service <start|stop|restart|status|kill <agent>>');
       process.exit(1);
     }
-    await handleService(action);
+    await handleService(action, args.slice(2));
     return;
   }
 
@@ -31,7 +31,7 @@ async function main(): Promise<void> {
     console.log('Usage:');
     console.log('  dialup setup                                            # interactive setup wizard');
     console.log('  dialup register --project <path> --agent <name> ...     # programmatic registration');
-    console.log('  dialup service <start|stop|restart|status>              # manage daemon');
+    console.log('  dialup service <start|stop|restart|status|kill <agent>>  # manage daemon');
     console.log('');
     console.log('Register flags:');
     console.log('  --project <path>         Project directory (required)');

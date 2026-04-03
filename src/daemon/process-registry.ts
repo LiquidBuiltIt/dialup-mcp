@@ -1,22 +1,38 @@
 import type { ChildProcess } from 'node:child_process';
 
 export class ProcessRegistry {
-  private processes = new Set<ChildProcess>();
+  private processes = new Map<string, ChildProcess>();
 
   get size(): number {
     return this.processes.size;
   }
 
-  register(child: ChildProcess): void {
-    this.processes.add(child);
+  register(key: string, child: ChildProcess): void {
+    this.processes.set(key, child);
   }
 
-  deregister(child: ChildProcess): void {
-    this.processes.delete(child);
+  deregister(key: string): void {
+    this.processes.delete(key);
+  }
+
+  has(key: string): boolean {
+    return this.processes.has(key);
+  }
+
+  kill(key: string): boolean {
+    const child = this.processes.get(key);
+    if (!child) return false;
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // Process already dead — ignore
+    }
+    this.processes.delete(key);
+    return true;
   }
 
   killAll(): void {
-    for (const child of this.processes) {
+    for (const child of this.processes.values()) {
       try {
         child.kill('SIGTERM');
       } catch {

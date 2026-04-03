@@ -19,6 +19,7 @@ export interface DialupConfig {
   systemPrompt?: string;
   executeMode: boolean;
   model: AgentModel;
+  parallelWork?: boolean;
 }
 
 // --- Agent Capabilities ---
@@ -37,6 +38,28 @@ export interface AgentInfo {
   capabilities: AgentCapabilities;
 }
 
+// --- Discover Agents (lightweight directory) ---
+
+export interface DiscoverAgentInfo {
+  agent: string;
+  description: string;
+  executeEnabled: boolean;
+}
+
+export interface DiscoverAgentsParams {
+  filter?: string; // Substring match against capability names
+}
+
+export interface DiscoverAgentsResult {
+  agents: DiscoverAgentInfo[];
+}
+
+// --- List Agents (full capabilities for specific agents) ---
+
+export interface ListAgentsParams {
+  agents: string[]; // Agent names to query
+}
+
 // --- Conversation ---
 
 export interface ConversationExchange {
@@ -51,6 +74,7 @@ export interface ConversationRecord {
   sessionId: string;
   sender: string;
   recipient: string;
+  sessionName?: string;
   exchanges: ConversationExchange[];
 }
 
@@ -84,7 +108,11 @@ export type JsonRpcResponse = JsonRpcSuccessResponse | JsonRpcErrorResponse;
 // --- RPC Method Params/Results ---
 
 export interface ListAgentsResult {
-  agents: AgentInfo[];
+  agents: Record<string, {
+    description: string;
+    executeEnabled: boolean;
+    capabilities: AgentCapabilities;
+  }>;
 }
 
 export type AgentMode = 'oracle' | 'execute';
@@ -99,6 +127,7 @@ export interface AskAgentParams {
   files?: string[];
   tools?: string[];    // Individual tool names for execute mode
   servers?: string[];  // MCP server names — grants all tools from these servers
+  sessionName?: string; // Human-readable label for this conversation (e.g. "AX feedback loop")
 }
 
 export interface TokenUsage {
@@ -115,6 +144,39 @@ export interface AskAgentResult {
 export interface RegisterAgentParams {
   agent: string;
   project: string;
+}
+
+// --- Daemon Status ---
+
+export interface DaemonStatusAgent {
+  agent: string;
+  project: string;
+  executeEnabled: boolean;
+}
+
+export interface DaemonStatusJob {
+  targetAgent: string;
+  startedAt: string; // ISO 8601
+  runningFor: string; // human-readable duration
+  sessionName?: string;
+}
+
+export interface DaemonStatusSession {
+  sessionId: string;
+  sender: string;
+  recipient: string;
+  sessionName?: string;
+  exchanges: number;
+}
+
+export interface DaemonStatus {
+  pid: number;
+  uptime: string; // human-readable
+  uptimeMs: number;
+  agents: DaemonStatusAgent[];
+  activeJobs: DaemonStatusJob[];
+  activeProcesses: number;
+  sessions: DaemonStatusSession[];
 }
 
 // --- Registry ---

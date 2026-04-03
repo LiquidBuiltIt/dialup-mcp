@@ -9,22 +9,21 @@ import type {
   JsonRpcResponse,
   JsonRpcSuccessResponse,
   JsonRpcErrorResponse,
-  AgentInfo,
+  DiscoverAgentInfo,
+  DiscoverAgentsResult,
   ListAgentsResult,
   AskAgentParams,
   AskAgentResult,
+  DaemonStatus,
 } from '../shared/types.js';
 import { buildRequest, serializeMessage, createMessageParser } from '../shared/protocol.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const REQUEST_TIMEOUT_MS = 610_000; // Slightly longer than 10min claude spawn timeout
-
 interface PendingRequest {
   resolve: (result: unknown) => void;
   reject: (err: Error) => void;
-  timer: NodeJS.Timeout;
 }
 
 export class DaemonClient {
@@ -111,7 +110,7 @@ export class DaemonClient {
           if (!pending) return;
 
           this.pendingRequests.delete(response.id);
-          clearTimeout(pending.timer);
+
 
           if ('error' in response) {
             const errResp = response as JsonRpcErrorResponse;
@@ -144,7 +143,6 @@ export class DaemonClient {
     this.socket = null;
     // Reject all pending requests
     for (const [id, pending] of this.pendingRequests) {
-      clearTimeout(pending.timer);
       pending.reject(err);
     }
     this.pendingRequests.clear();
@@ -159,15 +157,9 @@ export class DaemonClient {
     const msg = buildRequest(method, params, id);
 
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new Error(`Request timed out: ${method}`));
-      }, REQUEST_TIMEOUT_MS);
-
       this.pendingRequests.set(id, {
         resolve: resolve as (result: unknown) => void,
         reject,
-        timer,
       });
 
       this.socket!.write(serializeMessage(msg));
@@ -180,15 +172,22 @@ export class DaemonClient {
       this.socket = null;
     }
     for (const [, pending] of this.pendingRequests) {
-      clearTimeout(pending.timer);
+      pending.reject(new Error('Client disconnected'));
     }
     this.pendingRequests.clear();
   }
 
   // --- Convenience methods ---
 
-  async listAgents(): Promise<AgentInfo[]> {
-    const result = await this.request<ListAgentsResult>('dialup.listAgents', {});
+  async discoverAgents(filter?: string): Promise<DiscoverAgentInfo[]> {
+    const params: Record<string, unknown> = {};
+    if (filter) params.filter = filter;
+    const result = await this.request<DiscoverAgentsResult>('dialup.discoverAgents', params);
+    return result.agents;
+  }
+
+  async listAgents(agents: string[]): Promise<ListAgentsResult['agents']> {
+    const result = await this.request<ListAgentsResult>('dialup.listAgents', { agents });
     return result.agents;
   }
 
@@ -205,6 +204,14 @@ export class DaemonClient {
 
   async heartbeat(): Promise<void> {
     await this.request('dialup.heartbeat', {});
+  }
+
+  async status(): Promise<DaemonStatus> {
+    return this.request<DaemonStatus>('dialup.status', {});
+  }
+
+  async kill(targetAgent: string): Promise<{ ok: boolean; killed: string }> {
+    return this.request('dialup.kill', { targetAgent });
   }
 
 }

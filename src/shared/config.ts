@@ -13,6 +13,7 @@ export const DialupConfigSchema = z.object({
   systemPrompt: z.string().optional(),
   executeMode: z.boolean(),
   model: AgentModelSchema.default('haiku'),
+  parallelWork: z.boolean().optional(),
 });
 
 export function parseDialupConfig(raw: unknown): DialupConfig {

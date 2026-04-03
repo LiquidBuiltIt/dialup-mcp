@@ -8,9 +8,15 @@ import type {
   AskAgentResult,
   RegisterAgentParams,
   ListAgentsResult,
-  AgentInfo,
   AgentCapabilities,
   DialupConfig,
+  DaemonStatus,
+  DaemonStatusAgent,
+  DaemonStatusJob,
+  DiscoverAgentsParams,
+  DiscoverAgentInfo,
+  DiscoverAgentsResult,
+  ListAgentsParams,
 } from '../shared/types.js';
 import { EXECUTE_TOOLS, MCP_TOOL_PATTERN } from '../shared/types.js';
 import { loadRegistry, saveRegistry } from '../shared/registry.js';
@@ -25,8 +31,42 @@ import { composeSystemPrompt, composeMessage, spawnClaude } from './spawner.js';
 import { ProcessRegistry } from './process-registry.js';
 import { stageFiles, cleanupInbox } from './inbox.js';
 
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainSec = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${remainSec}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainMin = minutes % 60;
+  return `${hours}h ${remainMin}m`;
+}
+
 interface ResolvedAgent extends DialupConfig {
   project: string;
+}
+
+// Exported for testing
+export interface AgentWithCapabilities {
+  agent: string;
+  description: string;
+  executeEnabled: boolean;
+  capabilities: AgentCapabilities;
+}
+
+export function filterAgentsByCapability(
+  agents: AgentWithCapabilities[],
+  filter: string | undefined,
+): AgentWithCapabilities[] {
+  if (!filter) return agents;
+  const lower = filter.toLowerCase();
+  return agents.filter((a) => {
+    for (const [serverName, tools] of Object.entries(a.capabilities)) {
+      if (serverName.toLowerCase().includes(lower)) return true;
+      if (tools.some((tool) => tool.toLowerCase().includes(lower))) return true;
+    }
+    return false;
+  });
 }
 
 export class DaemonServer {
@@ -38,6 +78,7 @@ export class DaemonServer {
   private processRegistry = new ProcessRegistry();
   private heartbeatTracker: HeartbeatTracker;
   private shuttingDown = false;
+  private startedAt = Date.now();
 
   constructor() {
     this.heartbeatTracker = new HeartbeatTracker(() => this.shutdown());
@@ -176,6 +217,9 @@ export class DaemonServer {
 
     try {
       switch (request.method) {
+        case 'dialup.discoverAgents':
+          response = await this.handleDiscoverAgents(request);
+          break;
         case 'dialup.listAgents':
           response = await this.handleListAgents(request);
           break;
@@ -187,6 +231,12 @@ export class DaemonServer {
           break;
         case 'dialup.registerAgent':
           response = await this.handleRegisterAgent(request);
+          break;
+        case 'dialup.status':
+          response = this.handleStatus(request);
+          break;
+        case 'dialup.kill':
+          response = this.handleKill(request);
           break;
         default:
           response = buildErrorResponse(request.id, -32601, `Method not found: ${request.method}`);
@@ -203,19 +253,66 @@ export class DaemonServer {
     }
   }
 
-  private async handleListAgents(request: JsonRpcRequest): Promise<JsonRpcResponse> {
-    const agents: AgentInfo[] = [];
+  private async handleDiscoverAgents(request: JsonRpcRequest): Promise<JsonRpcResponse> {
+    const params = request.params as unknown as DiscoverAgentsParams | undefined;
+    const filter = params?.filter;
+
+    if (filter) {
+      const agentsWithCaps: AgentWithCapabilities[] = [];
+      for (const r of this.agentRegistry.values()) {
+        const capabilities = await this.getCapabilities(r);
+        agentsWithCaps.push({
+          agent: r.agent,
+          description: r.description,
+          executeEnabled: r.executeMode,
+          capabilities,
+        });
+      }
+      const filtered = filterAgentsByCapability(agentsWithCaps, filter);
+      const agents: DiscoverAgentInfo[] = filtered.map(({ agent, description, executeEnabled }) => ({
+        agent, description, executeEnabled,
+      }));
+      const result: DiscoverAgentsResult = { agents };
+      return buildSuccessResponse(request.id, result);
+    }
+
+    const agents: DiscoverAgentInfo[] = [];
     for (const r of this.agentRegistry.values()) {
-      const capabilities = await this.getCapabilities(r);
       agents.push({
-        project: r.project,
         agent: r.agent,
         description: r.description,
         executeEnabled: r.executeMode,
-        capabilities,
       });
     }
-    const result: ListAgentsResult = { agents };
+    const result: DiscoverAgentsResult = { agents };
+    return buildSuccessResponse(request.id, result);
+  }
+
+  private async handleListAgents(request: JsonRpcRequest): Promise<JsonRpcResponse> {
+    const params = request.params as unknown as ListAgentsParams;
+
+    if (!params?.agents?.length) {
+      return buildErrorResponse(request.id, -32602, 'Missing required param: agents (array of agent names)');
+    }
+
+    const result: ListAgentsResult = { agents: {} };
+
+    for (const name of params.agents) {
+      const config = this.agentRegistry.get(name);
+      if (!config) {
+        return buildErrorResponse(
+          request.id, -32001,
+          `Agent '${name}' is not registered. Use discover_agents to see available agents.`,
+        );
+      }
+      const capabilities = await this.getCapabilities(config);
+      result.agents[name] = {
+        description: config.description,
+        executeEnabled: config.executeMode,
+        capabilities,
+      };
+    }
+
     return buildSuccessResponse(request.id, result);
   }
 
@@ -272,7 +369,7 @@ export class DaemonServer {
     if (mode === 'execute' && (!params.tools?.length && !params.servers?.length)) {
       return buildErrorResponse(
         request.id, -32602,
-        `Execute mode requires "tools" and/or "servers" specifying which tools to enable. Use list_agents to discover available capabilities.`,
+        `Execute mode requires "tools" and/or "servers" specifying which tools to enable. Use discover_agents + list_agents to see available capabilities.`,
       );
     }
 
@@ -286,7 +383,7 @@ export class DaemonServer {
 
       try {
         // Get or create conversation session
-        const sessionId = this.conversationManager.getOrCreateSession(params.senderAgent, params.targetAgent);
+        const sessionId = this.conversationManager.getOrCreateSession(params.senderAgent, params.targetAgent, params.sessionName);
 
         // Resolve tools for this request
         let executeTools: string[] | undefined;
@@ -302,7 +399,7 @@ export class DaemonServer {
           if (params.tools?.length) {
             for (const tool of params.tools) {
               if (!allCapTools.has(tool)) {
-                throw new Error(`Tool "${tool}" is not available on agent '${params.targetAgent}'. Use list_agents to see available capabilities.`);
+                throw new Error(`Tool "${tool}" is not available on agent '${params.targetAgent}'. Use discover_agents + list_agents to see available capabilities.`);
               }
               resolvedTools.add(tool);
             }
@@ -362,7 +459,7 @@ export class DaemonServer {
         const message = composeMessage({ conversationHistory, message: params.message });
 
         // Spawn claude with dynamically resolved tools + MCP config
-        const spawnResult = await spawnClaude(targetConfig.project, systemPrompt, message, mode, executeTools, targetConfig.model, this.processRegistry, mcpConfigJson);
+        const spawnResult = await spawnClaude(targetConfig.project, systemPrompt, message, mode, executeTools, targetConfig.model, this.processRegistry, mcpConfigJson, params.targetAgent);
 
         // Defense-in-depth: reject empty responses even if spawnClaude didn't
         if (!spawnResult.response.trim()) {
@@ -386,7 +483,7 @@ export class DaemonServer {
           console.error(`[dialup-daemon] Cleaned up inbox at ${targetConfig.project}`);
         }
       }
-    });
+    }, { sessionName: params.sessionName, parallel: targetConfig.parallelWork });
 
     return buildSuccessResponse(request.id, result);
   }
@@ -409,6 +506,60 @@ export class DaemonServer {
     this.capabilitiesCache.delete(params.project); // Force re-introspect on next access
     console.error(`[dialup-daemon] Registered agent: ${params.agent} (${params.project})`);
     return buildSuccessResponse(request.id, { ok: true });
+  }
+
+  private handleKill(request: JsonRpcRequest): JsonRpcResponse {
+    const params = request.params as unknown as { targetAgent?: string };
+    if (!params?.targetAgent) {
+      return buildErrorResponse(request.id, -32602, 'Missing required param: targetAgent');
+    }
+
+    const killed = this.processRegistry.kill(params.targetAgent);
+    if (!killed) {
+      return buildErrorResponse(
+        request.id, -32004,
+        `No active process for agent '${params.targetAgent}'. Active: ${this.agentQueue.active.map((j) => j.targetAgent).join(', ') || 'none'}`,
+      );
+    }
+
+    console.error(`[dialup-daemon] Killed process for agent: ${params.targetAgent}`);
+    return buildSuccessResponse(request.id, { ok: true, killed: params.targetAgent });
+  }
+
+  private handleStatus(request: JsonRpcRequest): JsonRpcResponse {
+    const now = Date.now();
+    const uptimeMs = now - this.startedAt;
+
+    const agents: DaemonStatusAgent[] = [];
+    for (const r of this.agentRegistry.values()) {
+      agents.push({
+        agent: r.agent,
+        project: r.project,
+        executeEnabled: r.executeMode,
+      });
+    }
+
+    const activeJobs: DaemonStatusJob[] = this.agentQueue.active.map((job) => {
+      const runningMs = now - new Date(job.startedAt).getTime();
+      return {
+        targetAgent: job.targetAgent,
+        startedAt: job.startedAt,
+        runningFor: formatDuration(runningMs),
+        sessionName: job.sessionName,
+      };
+    });
+
+    const status: DaemonStatus = {
+      pid: process.pid,
+      uptime: formatDuration(uptimeMs),
+      uptimeMs,
+      agents,
+      activeJobs,
+      activeProcesses: this.processRegistry.size,
+      sessions: this.conversationManager.getSessionSummaries(),
+    };
+
+    return buildSuccessResponse(request.id, status);
   }
 
   async shutdown(): Promise<void> {

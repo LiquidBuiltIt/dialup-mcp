@@ -176,7 +176,7 @@ export function validateSpawnResult(stdout: string, stderr: string, exitCode: nu
   }
 }
 
-export function spawnClaude(projectDir: string, systemPrompt: string, message: string, mode?: AgentMode, executeTools?: string[], model?: AgentModel, registry?: ProcessRegistry, mcpConfigJson?: string): Promise<SpawnResult> {
+export function spawnClaude(projectDir: string, systemPrompt: string, message: string, mode?: AgentMode, executeTools?: string[], model?: AgentModel, registry?: ProcessRegistry, mcpConfigJson?: string, targetAgent?: string): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
     // Oracle mode: read-only tools only
     // Execute mode: read-only tools + whitelisted executive tools
@@ -210,7 +210,8 @@ export function spawnClaude(projectDir: string, systemPrompt: string, message: s
       env: cleanEnv,
     });
 
-    if (registry) registry.register(child);
+    const regKey = targetAgent ?? `pid-${child.pid}`;
+    if (registry) registry.register(regKey, child);
 
     let stdout = '';
     let stderr = '';
@@ -219,7 +220,7 @@ export function spawnClaude(projectDir: string, systemPrompt: string, message: s
     child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
 
     child.on('close', (code) => {
-      if (registry) registry.deregister(child);
+      if (registry) registry.deregister(regKey);
 
       // Always log stderr for diagnostics
       if (stderr.trim()) {
@@ -235,7 +236,7 @@ export function spawnClaude(projectDir: string, systemPrompt: string, message: s
     });
 
     child.on('error', (err) => {
-      if (registry) registry.deregister(child);
+      if (registry) registry.deregister(regKey);
       reject(new Error(`Failed to spawn claude: ${err.message}`));
     });
 
